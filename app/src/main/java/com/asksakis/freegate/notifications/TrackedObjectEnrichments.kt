@@ -38,7 +38,27 @@ class TrackedObjectEnrichments {
          */
         @Volatile var snapshot: Bitmap? = null,
         @Volatile var description: String? = null,
+        /**
+         * The tracked object this notification has been enriched from, once one has spoken.
+         * A review covers everything that happened in the same stretch of time, so a single
+         * notification can own a person, a motorcycle and a second person at once, and
+         * Frigate describes each of them separately. Letting every one of them write into
+         * the notification made the text flip between subjects and left whichever arrived
+         * last standing next to a picture of a different one. The first object to report
+         * something claims the notification; the rest are ignored.
+         */
+        @Volatile var claimedEventId: String? = null,
         val expiresAt: Long,
+    )
+
+    /** The outcome of folding an update in, when it was accepted. */
+    data class Applied(
+        val entry: Entry,
+        /**
+         * True the first time an object claims this notification, which is when the picture
+         * has to be refetched so that it shows the object the text is about.
+         */
+        val claimed: Boolean,
     )
 
     /** One thing Frigate learned about a tracked object. */
@@ -96,16 +116,23 @@ class TrackedObjectEnrichments {
      * for this object, which is the common case: most updates belong to reviews that were
      * filtered out, muted, or that predate the app being opened.
      */
-    fun apply(update: Update, now: Long = System.currentTimeMillis()): Entry? {
+    fun apply(update: Update, now: Long = System.currentTimeMillis()): Applied? {
         synchronized(lock) {
             purgeLocked(now)
             val entry = entries[update.eventId] ?: return null
+            val claimedBy = entry.claimedEventId
+            // A second object in the same review has nothing to add to a notification that
+            // is already about the first one, and saying otherwise would contradict the
+            // picture.
+            if (claimedBy != null && claimedBy != update.eventId) return null
+            val claimed = claimedBy == null
+            if (claimed) entry.claimedEventId = update.eventId
             when (update) {
                 is Update.Name -> entry.alert = entry.alert.copy(subLabel = update.name)
                 is Update.Plate -> entry.alert = entry.alert.copy(plate = update.plate)
                 is Update.Description -> entry.description = update.text
             }
-            return entry
+            return Applied(entry, claimed)
         }
     }
 

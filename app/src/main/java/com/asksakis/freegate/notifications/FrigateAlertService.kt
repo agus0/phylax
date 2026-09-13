@@ -135,7 +135,11 @@ class FrigateAlertService : Service() {
             startForegroundCompat(lastStatusText)
             val enrich = intent.getStringExtra(EXTRA_DEBUG_ENRICH)
             if (enrich != null) {
-                postDebugEnrichment(enrich, intent.getStringExtra(EXTRA_DEBUG_VALUE))
+                postDebugEnrichment(
+                    enrich,
+                    intent.getStringExtra(EXTRA_DEBUG_VALUE),
+                    second = intent.getStringExtra(EXTRA_DEBUG_OBJECT) == "2",
+                )
             } else {
                 postDebugNotification(
                     intent.getStringExtra(EXTRA_DEBUG_SEVERITY) ?: "detection",
@@ -356,8 +360,9 @@ class FrigateAlertService : Service() {
             startTimeSec = System.currentTimeMillis() / 1000.0,
             estimatedSpeedKph = if (isAlert) 6.0 else null,
             thumbnailPath = null,
-            // Fixed id so the companion enrichment intent needs no argument to match it.
-            detectionIds = listOf(DEBUG_OBJECT_ID),
+            // Two fixed ids, so the companion enrichment intent can play both the object
+            // that claims the notification and a second one that has to be ignored.
+            detectionIds = listOf(DEBUG_OBJECT_ID, DEBUG_OBJECT_ID_2),
         )
         Log.d(TAG, "Debug notify: severity=${alert.severity} id=${alert.id}")
         playSoundForSeverity(alert.severity)
@@ -523,10 +528,10 @@ class FrigateAlertService : Service() {
      * walk past a camera and for Frigate to finish recognising or describing them. The
      * payload is stringified exactly as Frigate sends it, so the double parse is tested too.
      */
-    private fun postDebugEnrichment(type: String, value: String?) {
+    private fun postDebugEnrichment(type: String, value: String?, second: Boolean = false) {
         val payload = JSONObject()
             .put("type", type)
-            .put("id", DEBUG_OBJECT_ID)
+            .put("id", if (second) DEBUG_OBJECT_ID_2 else DEBUG_OBJECT_ID)
             .put("camera", "doorbell")
         when (type) {
             "face" -> payload.put("name", value ?: "Sakis").put("score", 0.93)
@@ -555,15 +560,30 @@ class FrigateAlertService : Service() {
      */
     private fun processEnrichment(json: JSONObject) {
         val update = TrackedObjectEnrichments.parseFrame(json) ?: return
-        val entry = enrichments.apply(update) ?: return
+        val applied = enrichments.apply(update) ?: return
+        val entry = applied.entry
         if (!isNotificationShowing(entry.notificationId)) {
             Log.d(TAG, "Enrichment for ${update.eventId} dropped: notification no longer shown")
             return
         }
         Log.d(TAG, "Enriching notification ${entry.notificationId}: $update")
-        // No sound here. The user was alerted when the notification was first posted, and
-        // learning a name afterwards is not a second event.
-        notifier.notify(entry.alert, tapAction(), entry.snapshot, entry.description)
+        // No sound on a repost: the user was alerted when the notification was first
+        // posted, and Frigate learning a name afterwards is not a second event.
+        fun post() = notifier.notify(entry.alert, tapAction(), entry.snapshot, entry.description)
+        val baseUrl = lastBaseUrl ?: resolveBaseUrl()
+        if (applied.claimed && baseUrl != null) {
+            // The picture so far is of the first object the review named, which is not
+            // necessarily the one this text is about. Swap in the thumbnail of the object
+            // that actually spoke, so the two cannot describe different subjects.
+            scope.launch {
+                val bitmap = snapshotDownloader
+                    .download(baseUrl, "/api/events/${update.eventId}/thumbnail.jpg")
+                if (bitmap != null) entry.snapshot = bitmap
+                post()
+            }
+            return
+        }
+        post()
     }
 
     /** True while [id] is still in the shade. */
@@ -769,6 +789,8 @@ class FrigateAlertService : Service() {
          * the notification the debug alert posted:
          *     --es enrich description    # description, face, lpr
          *     --es value "some text"     # optional; a sensible default is used
+         *     --es object 2              # optional; speaks as a second tracked object,
+         *                                # which the notification should ignore
          */
         const val ACTION_DEBUG_NOTIFY = "com.asksakis.freegate.action.DEBUG_NOTIFY"
         const val EXTRA_DEBUG_SEVERITY = "severity"
@@ -776,8 +798,11 @@ class FrigateAlertService : Service() {
         const val EXTRA_DEBUG_ENRICH = "enrich"
         const val EXTRA_DEBUG_VALUE = "value"
 
-        /** Tracked object id the debug alert registers, so a debug enrichment can find it. */
+        const val EXTRA_DEBUG_OBJECT = "object"
+
+        /** Tracked object ids the debug alert registers, so a debug enrichment can find them. */
         private const val DEBUG_OBJECT_ID = "debug-object"
+        private const val DEBUG_OBJECT_ID_2 = "debug-object-2"
         const val PREF_LAST_ALERT_MS = "last_alert_received_ms"
         /**
          * Wall-clock millis of the most recent config change (enable, severities,
